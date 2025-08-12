@@ -525,6 +525,212 @@ def evaluate_model(model, dataset, device, original_files, fs, args):
     
     return all_results
 
+def summarize_results_across_folds(all_fold_results):
+    """
+    all_fold_results: list of dicts, each containing keys:
+      - 'test_file'
+      - 'avg_precision'
+      - 'avg_recall'
+      - 'avg_f1'
+      - 'avg_accuracy_peak'
+      - 'avg_accuracy_sample'
+      - 'details' (the list returned from evaluate_model)
+    """
+    if not all_fold_results:
+        print("No fold results to summarize.")
+        return
+
+    avg_precision = np.mean([fr['avg_precision'] for fr in all_fold_results])
+    avg_recall = np.mean([fr['avg_recall'] for fr in all_fold_results])
+    avg_f1 = np.mean([fr['avg_f1'] for fr in all_fold_results])
+    avg_acc_peak = np.mean([fr.get('avg_accuracy_peak', 0.0) for fr in all_fold_results])
+    avg_acc_sample = np.mean([fr.get('avg_accuracy_sample', 0.0) for fr in all_fold_results])
+
+    print("\n===== LOSO Summary Across Folds =====")
+    print(f"Folds: {len(all_fold_results)}")
+    print(f"Average Precision: {avg_precision:.4f}")
+    print(f"Average Recall:    {avg_recall:.4f}")
+    print(f"Average F1:        {avg_f1:.4f}")
+    print(f"Average Peak Acc:  {avg_acc_peak:.4f}")
+    print(f"Average Sample Acc:{avg_acc_sample:.4f}")
+
+    print("\nPer-fold results:")
+    for fr in all_fold_results:
+        print(f"- Test file {fr['test_file']}: "
+              f"P={fr['avg_precision']:.3f}, R={fr['avg_recall']:.3f}, "
+              f"F1={fr['avg_f1']:.3f}, Acc_peak={fr['avg_accuracy_peak']:.3f}, "
+              f"Acc_sample={fr['avg_accuracy_sample']:.3f}")
+
+def run_loso(args):
+    """
+    Perform Leave-One-Subject-Out CV across provided file_indices.
+    For each held-out file:
+      - Train on the remaining files
+      - Test on the held-out file
+    Aggregates metrics across all folds.
+    """
+    print("Running LOSO cross-validation...")
+    print(f"Subjects (files): {args.file_indices}")
+    # Load all files once
+    file_data_list, fs = load_multiple_files_wfdb(args.file_indices, args.data_dir, args.channel)
+    if len(file_data_list) < 2:
+        print("Need at least 2 files for LOSO.")
+        return
+
+    # Map: file_id -> (signal, qrs, id)
+    by_id = {fid: (sig, qrs, fid) for (sig, qrs, fid) in file_data_list}
+
+    all_fold_results = []
+
+    for test_id in args.file_indices:
+        if test_id not in by_id:
+            print(f"Skipping LOSO fold for {test_id}, not loaded.")
+            continue
+
+        print("\n" + "="*60)
+        print(f"LOSO fold: Test on file {test_id}, Train on the rest")
+        print("="*60)
+
+        # Build train/test lists for this fold
+        test_files = [by_id[test_id]]
+        train_files = [by_id[fid] for fid in args.file_indices if fid != test_id and fid in by_id]
+
+        if len(train_files) == 0:
+            print(f"Skipping fold for {test_id}: no training files available.")
+            continue
+
+        # Build config
+        cut_freq = max(8, int(args.seq_len * args.cut_ratio))
+        config = Config(
+            seq_len=args.seq_len,
+            pred_len=args.pred_len,
+            enc_in=1,
+            individual=args.individual,
+            cut_freq=cut_freq,
+            scale=args.scale,
+            data_size=args.data_size,
+            in_dataset_augmentation=args.in_dataset_augmentation,
+            aug_method=args.aug_method,
+            aug_rate=args.aug_rate,
+            aug_data_size=args.aug_data_size
+        )
+
+        # Datasets and loaders
+        print("Creating datasets for this fold...")
+        train_dataset = MultiFileECGDataset(config, train_files, flag='train', step=args.stride)
+        test_dataset = MultiFileECGDataset(config, test_files, flag='test', step=args.stride)
+
+        print(f"Training samples: {len(train_dataset)}")
+        print(f"Test samples: {len(test_dataset)}")
+
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                  drop_last=True, num_workers=args.num_workers)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,
+                                 num_workers=args.num_workers)
+
+        # Model/init
+        print("Initializing model for this fold...")
+        model = RealFITS(config).to(args.device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        criterion = nn.L1Loss()
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+
+        best_loss = float('inf')
+        patience_counter = 0
+
+        print(f"Starting training for up to {args.epochs} epochs...")
+        for epoch in range(1, args.epochs + 1):
+            # Train
+            model.train()
+            epoch_train_loss = 0.0
+            train_batches = 0
+            for x, y in train_loader:
+                x = x.to(args.device)
+                y = y.to(args.device)
+
+                optimizer.zero_grad()
+                out = model(x)
+                if isinstance(out, tuple):
+                    out = out[0]
+                loss = criterion(out, y)
+                loss.backward()
+                optimizer.step()
+
+                epoch_train_loss += loss.item()
+                train_batches += 1
+
+            avg_train_loss = epoch_train_loss / max(1, train_batches)
+
+            # Validate on test set for early stopping
+            model.eval()
+            epoch_val_loss = 0.0
+            val_batches = 0
+            with torch.no_grad():
+                for x, y in test_loader:
+                    x = x.to(args.device)
+                    y = y.to(args.device)
+                    out = model(x)
+                    if isinstance(out, tuple):
+                        out = out[0]
+                    loss = criterion(out, y)
+                    epoch_val_loss += loss.item()
+                    val_batches += 1
+
+            avg_val_loss = epoch_val_loss / max(1, val_batches)
+            scheduler.step(avg_val_loss)
+
+            if avg_val_loss < best_loss:
+                best_loss = avg_val_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), args.save_model)
+                print(f"Fold Test={test_id} Epoch {epoch}/{args.epochs} "
+                      f"- Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f} [BEST]")
+            else:
+                patience_counter += 1
+                print(f"Fold Test={test_id} Epoch {epoch}/{args.epochs} "
+                      f"- Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+
+            if patience_counter >= args.early_stopping_patience:
+                print(f"Early stopping for fold Test={test_id} at epoch {epoch}")
+                break
+
+        # Evaluate best model on the held-out file
+        print("Loading best model for evaluation for this fold...")
+        model.load_state_dict(torch.load(args.save_model))
+
+        print("Evaluating on held-out test file...")
+        results = evaluate_model(model, test_dataset, args.device, test_files, fs, args)
+
+        # Fold summary
+        if results:
+            avg_precision = np.mean([r['precision'] for r in results])
+            avg_recall = np.mean([r['recall'] for r in results])
+            avg_f1 = np.mean([r['f1'] for r in results])
+            avg_accuracy_peak = np.mean([r.get('accuracy_peak', 0.0) for r in results])
+            avg_accuracy_sample = np.mean([r.get('accuracy_sample', 0.0) for r in results])
+
+            print("\nFold summary:")
+            print(f"Test file: {test_id}")
+            print(f"Precision: {avg_precision:.4f}")
+            print(f"Recall:    {avg_recall:.4f}")
+            print(f"F1:        {avg_f1:.4f}")
+            print(f"Acc_peak:  {avg_accuracy_peak:.4f}")
+            print(f"Acc_sample:{avg_accuracy_sample:.4f}")
+
+            all_fold_results.append({
+                'test_file': test_id,
+                'avg_precision': avg_precision,
+                'avg_recall': avg_recall,
+                'avg_f1': avg_f1,
+                'avg_accuracy_peak': avg_accuracy_peak,
+                'avg_accuracy_sample': avg_accuracy_sample,
+                'details': results
+            })
+
+    # Global LOSO summary
+    summarize_results_across_folds(all_fold_results)
+
+
 def compute_metrics_sample_level(true_labels, pred_labels):
     """Compute sample-level metrics including accuracy"""
     precision, recall, f1, _ = precision_recall_fscore_support(
@@ -648,6 +854,8 @@ def main():
     parser.add_argument('--channel', type=int, default=0)
     parser.add_argument('--test_ratio', type=float, default=0.2, help='Ratio of files to use for testing')
     parser.add_argument('--show_info', action='store_true', help='Show detailed WFDB info')
+    parser.add_argument('--loso', action='store_true', help='Run LOSO cross-validation across provided file_indices')
+
     
     # Model arguments
     parser.add_argument('--seq_len', type=int, default=1024)
@@ -690,6 +898,11 @@ def main():
     if args.show_info:
         for idx in args.file_indices:
             show_wfdb_info(args.data_dir, f'r{idx:02d}')
+    
+    if args.loso:
+    # Run LOSO and exit
+        run_loso(args)
+        return
     
     # Load multiple files using WFDB
     print("\nLoading ECG files with WFDB...")
